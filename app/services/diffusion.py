@@ -1,32 +1,24 @@
 import asyncio
 import logging
 import time
+import base64
+import httpx
 from typing import Dict, Any, Tuple, Optional, List
-import numpy as np
+import json
 import io
-from PIL import Image, ImageDraw, ImageFont
-import threading
-import random
 import os
+import numpy as np
+from PIL import Image
 
 from app.models.settings import DiffusionSettings
 from app.utils.image import decode_image, encode_image, resize_image
 from app.core.config import settings
 
-from streamdiffusion import StreamDiffusion
-from streamdiffusion.schedulers import KarrasDiffusionSchedulers
-from diffusers import AutoencoderKL, UNet2DConditionModel
-from transformers import CLIPTextModel, CLIPTokenizer
-import torch
-
 logger = logging.getLogger(__name__)
 
 class DiffusionService:
     """
-    Service for handling diffusion model operations
-
-    This is a placeholder implementation that will be replaced with actual
-    StreamDiffusion integration.
+    Service for handling diffusion model operations through an external StreamDiffusion service
     """
 
     def __init__(self):
@@ -35,11 +27,29 @@ class DiffusionService:
         self._model_loaded = False
         self._model_id = None
         self._model_name = None
-        self._lock = threading.Lock()
-        self._loading = False
+        self._stream_service_url = os.environ.get("STREAMDIFFUSION_URL", "http://localhost:8001")
+        self._client = httpx.AsyncClient(timeout=60.0)  # Longer timeout for image processing
 
-    def is_model_loaded(self) -> bool:
+    async def _check_service_status(self) -> Dict[str, Any]:
+        """Check the status of the StreamDiffusion service"""
+        try:
+            response = await self._client.get(f"{self._stream_service_url}/status")
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(f"Error checking service status: {response.status_code} {response.text}")
+                return {"status": "error", "model_loaded": False}
+        except Exception as e:
+            logger.error(f"Error connecting to StreamDiffusion service: {e}")
+            return {"status": "error", "model_loaded": False}
+
+    async def is_model_loaded(self) -> bool:
         """Check if model is loaded"""
+        status = await self._check_service_status()
+        self._model_loaded = status.get("model_loaded", False)
+        self._model_id = status.get("model_id")
+        if self._model_id:
+            self._model_name = self._model_id.split("/")[-1]
         return self._model_loaded
 
     def get_model_id(self) -> Optional[str]:
@@ -64,66 +74,28 @@ class DiffusionService:
                 logger.warning(f"Unknown setting: {key}")
 
     async def load_model(self, model_id: str) -> None:
-        """Load a StreamDiffusion model"""
-        if self._loading:
-            logger.warning("Already loading a model, please wait")
-            return
-
-        self._loading = True
-        self._model_loaded = False
-
+        """Load a StreamDiffusion model via the service"""
         try:
             logger.info(f"Loading model: {model_id}")
-
-            # Use an event loop to run CPU-intensive tasks
-            loop = asyncio.get_event_loop()
-
-            # Load models on a separate thread to not block the main event loop
-            def _load_model():
-                # Load model components
-                unet = UNet2DConditionModel.from_pretrained(
-                    model_id, subfolder="unet", torch_dtype=torch.float16
-                )
-                tokenizer = CLIPTokenizer.from_pretrained(
-                    model_id, subfolder="tokenizer"
-                )
-                text_encoder = CLIPTextModel.from_pretrained(
-                    model_id, subfolder="text_encoder", torch_dtype=torch.float16
-                )
-                vae = AutoencoderKL.from_pretrained(
-                    model_id, subfolder="vae", torch_dtype=torch.float16
-                )
-
-                # Create StreamDiffusion instance
-                stream = StreamDiffusion(
-                    unet=unet,
-                    vae=vae,
-                    tokenizer=tokenizer,
-                    text_encoder=text_encoder,
-                    scheduler_type=KarrasDiffusionSchedulers.DPM_SOLVER_MULTISTEP,
-                    device=torch.device(f"cuda:{settings.gpu_device}"),
-                )
-
-                # Configure StreamDiffusion
-                stream.enable_vae_slicing()
-                stream.enable_xformers_memory_efficient_attention()
-
-                # Set inference parameters
-                stream.update_tokenizer()
-                stream.set_width(512)
-                stream.set_height(512)
-
-                return stream
-
-            # Run model loading in a thread pool
-            self._stream = await loop.run_in_executor(None, _load_model)
-
-            # Set model details
-            self._model_id = model_id
-            self._model_name = model_id.split("/")[-1]
-            logger.info(f"Model loaded: {self._model_name}")
-            self._model_loaded = True
-
+            
+            # Call the service to load the model
+            response = await self._client.post(
+                f"{self._stream_service_url}/load",
+                json={"model_id": model_id}
+            )
+            
+            if response.status_code == 200:
+                self._model_id = model_id
+                self._model_name = model_id.split("/")[-1]
+                self._model_loaded = True
+                logger.info(f"Model loaded: {self._model_name}")
+            else:
+                logger.error(f"Error loading model: {response.status_code} {response.text}")
+                self._model_loaded = False
+                self._model_id = None
+                self._model_name = None
+                raise ValueError(f"Failed to load model: {response.text}")
+        
         except Exception as e:
             logger.error(f"Error loading model: {e}")
             self._model_loaded = False
@@ -131,63 +103,58 @@ class DiffusionService:
             self._model_name = None
             raise
 
-        finally:
-            self._loading = False
-
     async def process_frame(self, frame_data: bytes) -> Tuple[bytes, int, int]:
-        """Process a frame with StreamDiffusion"""
-        if not self._model_loaded:
+        """Process a frame with StreamDiffusion service"""
+        if not await self.is_model_loaded():
             raise ValueError("Model not loaded")
 
         try:
-            # Decode the input image
+            # Decode the input image to get dimensions
             image, width, height = decode_image(frame_data)
-
-            # Ensure image is RGB
-            if image.shape[2] == 4:  # RGBA
-                image = image[:, :, :3]
-
-            # Resize to model dimensions if needed
-            image = resize_image(image, width=512, height=512)
-
-            # Convert to torch tensor
-            torch_image = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(
-                device=f"cuda:{settings.gpu_device}", dtype=torch.float16
+            
+            # Encode the frame data to base64
+            b64_image = base64.b64encode(frame_data).decode("utf-8")
+            
+            # Prepare the request data
+            request_data = {
+                "image": b64_image,
+                "prompt": self._settings.prompt,
+                "negative_prompt": self._settings.negative_prompt,
+                "denoising_strength": self._settings.denoising_strength,
+                "guidance_scale": self._settings.guidance,
+                "steps": self._settings.steps,
+                "width": 512,  # Fixed size for now, could be made configurable
+                "height": 512,
+            }
+            
+            # Send the request to the service
+            start_time = time.time()
+            response = await self._client.post(
+                f"{self._stream_service_url}/process/base64",
+                json=request_data
             )
-            torch_image = torch_image / 127.5 - 1.0
-
-            # Run diffusion
-            loop = asyncio.get_event_loop()
-
-            def _run_diffusion():
-                # Set text prompt
-                self._stream.set_text_prompt(
-                    self._settings.prompt, self._settings.negative_prompt
-                )
-
-                # Set denoising strength
-                self._stream.set_strength(self._settings.denoising_strength)
-
-                # Process the image
-                output = self._stream.stream_image(
-                    torch_image, 
-                    step=self._settings.steps,
-                    cfg_scale=self._settings.guidance
-                )
-
-                # Convert back to numpy
-                output_np = output.permute(0, 2, 3, 1).cpu().numpy()
-                output_np = ((output_np[0] + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
-
-                return output_np
-
-            # Run diffusion in a thread pool
-            processed = await loop.run_in_executor(None, _run_diffusion)
-
-            # Encode the result
-            result_data, width, height = encode_image(processed)
-
-            return result_data, width, height
+            
+            if response.status_code != 200:
+                logger.error(f"Error processing image: {response.status_code} {response.text}")
+                raise ValueError(f"Error from StreamDiffusion service: {response.text}")
+            
+            # Parse the response
+            result = response.json()
+            processing_time = time.time() - start_time
+            logger.info(f"Image processed in {processing_time:.2f}s")
+            
+            # Decode the processed image
+            processed_b64 = result.get("processed_image")
+            if not processed_b64:
+                raise ValueError("No processed image in response")
+            
+            processed_data = base64.b64decode(processed_b64)
+            
+            # Get image dimensions
+            img = Image.open(io.BytesIO(processed_data))
+            width, height = img.size
+            
+            return processed_data, width, height
 
         except Exception as e:
             logger.error(f"Error processing frame: {e}")
