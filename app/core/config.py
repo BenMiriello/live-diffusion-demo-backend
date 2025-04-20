@@ -31,6 +31,16 @@ class Settings(BaseSettings):
         def parse_env_var(cls, field_name: str, raw_val: str) -> any:
             """Parse environment variables."""
             if field_name == "cors_origins" and raw_val:
+                # Handle empty string case
+                if not raw_val or raw_val.strip() == '':
+                    return ["http://localhost:5173", "http://localhost:4173"]
+                
+                # Strip quotes if present
+                if (raw_val.startswith('"') and raw_val.endswith('"')) or \
+                (raw_val.startswith("'") and raw_val.endswith("'")):
+                    raw_val = raw_val[1:-1]
+                
+                # Split by comma and strip whitespace
                 return [origin.strip() for origin in raw_val.split(",")]
             return raw_val
 
