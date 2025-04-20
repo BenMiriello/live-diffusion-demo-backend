@@ -21,28 +21,16 @@ class Settings(BaseSettings):
     model_id: str = Field("stabilityai/sd-turbo", env="MODEL_ID")
     gpu_device: int = Field(0, env="GPU_DEVICE")
     denoising_strength: float = Field(0.5, env="DENOISING_STRENGTH")
+    
+    # StreamDiffusion Service URL
+    streamdiffusion_url: str = Field("http://streamdiffusion:8001", env="STREAMDIFFUSION_URL")
 
-    class Config:
-        """Pydantic config"""
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-
-        @classmethod
-        def parse_env_var(cls, field_name: str, raw_val: str) -> any:
-            """Parse environment variables."""
-            if field_name == "cors_origins" and raw_val:
-                # Handle empty string case
-                if not raw_val or raw_val.strip() == '':
-                    return ["http://localhost:5173", "http://localhost:4173"]
-                
-                # Strip quotes if present
-                if (raw_val.startswith('"') and raw_val.endswith('"')) or \
-                (raw_val.startswith("'") and raw_val.endswith("'")):
-                    raw_val = raw_val[1:-1]
-                
-                # Split by comma and strip whitespace
-                return [origin.strip() for origin in raw_val.split(",")]
-            return raw_val
+    model_config = {
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "extra": "ignore",
+        "protected_namespaces": ("settings_",),
+    }
 
 # Create global settings object
-settings = Settings()
+settings = Settings(_env_file=".env")
